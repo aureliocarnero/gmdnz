@@ -12,6 +12,17 @@
 
 ## Installation
 
+
+Localy, do enviroment as: conda activate gmdnz-dev
+- conda install numpy
+- conda install tensorflow
+- conda install -c conda-forge tensorflow-probability
+- conda install conda-forge::tf-keras
+- conda install pandas
+- conda install astropy
+- conda install seaborn
+- conda install anaconda::scikit-learn
+
 ```console
 pip install gmdnz
 ```
