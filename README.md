@@ -27,6 +27,8 @@ Localy, do enviroment as: conda activate gmdnz-dev
 pip install gmdnz
 ```
 
+https://vishal-techdocs.onrender.com/docs/programming/python/python-logging-tutorial
+
 ## License
 
 `gmdnz` is distributed under the terms of the [MIT](https://spdx.org/licenses/MIT.html) license.
