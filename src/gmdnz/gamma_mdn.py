@@ -6,31 +6,40 @@ import tensorflow_probability as tfp
 import keras
 import numpy as np
 import pandas as pd
+from keras.callbacks import EarlyStopping
 
 tfd = tfp.distributions
 
 
-def get_mixture_coef(output, tonumpy=False):
+def get_mixture_coef(output, tonumpy = False):
+    
     """
-    Mapping output layer to mixute components and shape
-    parameters of the distribution (pi, alpha, beta)
+    Maps the MDN output to the mixture coefficients (pi) and
+    the Gamma distribution parameters (alpha, beta).
+
+    Parameters:
+    - output (Tensor): Network output of shape (batch_size, K*3)
+    - tonumpy (bool): If True, returns NumPy arrays instead of Tensors.
+
+    Returns:
+    - out_pi: Mixture weights (softmax normalized)
+    - out_alpha: Gamma shape parameters (concentration)
+    - out_beta: Gamma rate parameters
     """
-    ### split the last layer in 3 'blocks'
-    out_pi, out_alpha, out_beta = tf.split(output, 3, 1)
 
-    ### softmax transform out_pi
-    max_pi = tf.reduce_max(out_pi, 1, keepdims = True)
-    out_pi = tf.subtract(out_pi, max_pi)
-    out_pi = tf.exp(out_pi)
-    normalize_pi = tfm.reciprocal(tf.reduce_sum(out_pi, 1, keepdims = True))
-    out_pi = tf.multiply(normalize_pi, out_pi)
+    # Split output into pi, alpha, beta (each of shape: batch_size x K)
+    out_pi, out_alpha, out_beta = tf.split(output, 3, axis = 1)
 
-    ### For out_alpha and out_beta we just add an offset
+    # Softmax normalization of pi (subtract max for numerical stability)
+    max_pi = tf.reduce_max(out_pi, axis = 1, keepdims = True)
+    out_pi = tf.exp(out_pi - max_pi)
+    out_pi /= tf.reduce_sum(out_pi, axis = 1, keepdims = True)
+
+    # Enforce minimum values for stability
     alpha_min = 2.0
-    out_alpha = tfm.add(out_alpha,alpha_min)
-
     beta_min = 0.1
-    out_beta = tfm.add(out_beta,beta_min)
+    out_alpha = out_alpha + alpha_min
+    out_beta = out_beta + beta_min
 
     if tonumpy:
         return out_pi.numpy(), out_alpha.numpy(), out_beta.numpy()
@@ -38,198 +47,407 @@ def get_mixture_coef(output, tonumpy=False):
         return out_pi, out_alpha, out_beta
 
 
-def gm_ll_loss(z_true, z_pred):  #This could be substituted by CRPS?
-    # get mixture coefficients    
+def gm_ll_loss(z_true, z_pred):
+
+    """
+    Computes the negative log-likelihood loss for a Gamma Mixture Density Network.
+
+    Parameters:
+    - z_true (Tensor): True target values, shape (batch_size, 1)
+    - z_pred (Tensor): Predicted mixture parameters, shape (batch_size, K*3)
+
+    Returns:
+    - loss (Tensor): Mean negative log-likelihood
+    """
+
+    # Extract mixture coefficients and distribution parameters
     out_pi, out_alpha, out_beta = get_mixture_coef(z_pred)
 
-    # define mixture distribution
+    # Define the Gamma mixture model
     gm = tfd.MixtureSameFamily(
         mixture_distribution = tfd.Categorical(probs = out_pi),
         components_distribution = tfd.Gamma(
             concentration = out_alpha,
-            rate = out_beta))
+            rate = out_beta)
+        )
 
-    # Evaluate log-probability of y
-    log_likelihood = gm.log_prob(tf.transpose(z_true))
-    return -tf.reduce_mean(log_likelihood, axis = -1)
+    # Calculate log-probability of true values
+    log_likelihood = gm.log_prob(tf.squeeze(z_true, axis = -1))  # Ensure proper shape
+
+    # Return mean negative log-likelihood
+    return -tf.reduce_mean(log_likelihood)
 
 
+def crps_mixture_gamma(z_true, z_pred, num_samples = 200):
+
+    """
+    Computes CRPS for a mixture of Gamma distributions using Monte Carlo approximation.
+
+    Parameters:
+    - z_true: Tensor of shape (batch_size, 1), true target values.
+    - z_pred: Tensor of shape (batch_size, K*3), MDN predictions.
+    - num_samples: Number of Monte Carlo samples to approximate CRPS.
+
+    Returns:
+    - crps: Tensor, mean CRPS over the batch.
+    """
+
+    batch_size = tf.shape(z_true)[0]
+    out_pi, out_alpha, out_beta = get_mixture_coef(z_pred)
+
+    # Define Gamma Mixture
+    gm = tfd.MixtureSameFamily(
+        mixture_distribution = tfd.Categorical(probs = out_pi),
+        components_distribution = tfd.Gamma(concentration = out_alpha, rate = out_beta)
+    )
+
+    # Sample from the predicted mixture
+    samples = gm.sample(num_samples)  # Shape: (num_samples, batch_size)
+    samples = tf.transpose(samples)   # Shape: (batch_size, num_samples)
+
+    # First CRPS term: Mean absolute error between samples and true value
+    abs_diff = tf.abs(samples - z_true)
+    term1 = tf.reduce_mean(abs_diff, axis = 1)  # Shape: (batch_size,)
+
+    # Second CRPS term: Expected pairwise distance between samples
+    samples1 = tf.expand_dims(samples, axis = 2)  # Shape: (batch_size, num_samples, 1)
+    samples2 = tf.expand_dims(samples, axis = 1)  # Shape: (batch_size, 1, num_samples)
+    pairwise_diff = tf.abs(samples1 - samples2)
+    term2 = 0.5 * tf.reduce_mean(pairwise_diff, axis = [1, 2])  # Shape: (batch_size,)
+
+    crps = term1 - term2
+    return tf.reduce_mean(crps)  # Return mean CRPS over batch
 
 
-# define network architecture with Keras layers
 def Gamma_MDN(K, n_neurons, losses, input_shape, RI = True):
-  """
-  Helper function to define and compile the MDN model.
-  We allow the posibility of using the Reliability Index (RI) as metric
-  """
-  # Mixture parameters
-  KMIX = K  # number of mixtures
-  NOUT = KMIX * 3  # KMIX times a pi, alpha and beta
 
-  optimizer = keras.optimizers.Adam(clipnorm = 1.0, learning_rate = 1e-4)
+    """
+    Builds and compiles a Gamma Mixture Density Network (MDN) using Keras Sequential API.
 
-  # number of neurons of each layer
-  n_hidden_1 = n_neurons  # 1st layer
-  n_hidden_2 = int(n_hidden_1/2)  # 2nd layer
-  n_hidden_3 = int(n_hidden_2/2)  # 3rd layer
+    Parameters:
+    - K (int): Number of mixture components.
+    - n_neurons (int): Number of neurons in the first hidden layer.
+    - losses (str or callable): Loss function to use.
+    - input_shape (int): Number of input features.
+    - RI (bool): Whether to include the Reliability Index (RI) as a metric.
 
-  # set initializer properties (to fix random seed)
-  initializer = keras.initializers.HeUniform(seed = 2718)
+    Returns:
+    - model (keras.Model): Compiled Keras model.
+    """
 
-  # initialize network and add layers
-  model = Sequential()
-  model.add(Input(shape = (input_shape, )))
-  # add hidden layer 1
-  model.add(Dense(n_hidden_1, #input_shape=(input_shape,),
-                  kernel_initializer = initializer,
-                  use_bias = False, name = 'Hidden_1'))
+    # Mixture model parameters: K components, each with pi, alpha, and beta
+    KMIX = K  
+    NOUT = KMIX * 3  # Total outputs: pi, alpha, beta for each mixture component
 
-  model.add(BatchNormalization(name = 'Batch_1'))
-  model.add(Activation('relu', name = 'ReLU_1'))
-  # add hidden layer 2
-  model.add(Dense(n_hidden_2,
-                  kernel_initializer = initializer,
-                  use_bias = False, name = 'Hidden_2'))
-  model.add(BatchNormalization(name = 'Batch_2'))
-  model.add(Activation('relu', name = 'ReLU_2'))
-  # add hidden layer 3
-  model.add(Dense(n_hidden_3,
-                  kernel_initializer = initializer,
-                  use_bias = False, name = 'Hidden_3'))
-  model.add(BatchNormalization(name = 'Batch_3'))
-  model.add(Activation('relu', name = 'ReLU_3'))
-  # add output layer (the one for the mixture parameters)
-  model.add(Dense(NOUT,
-                  kernel_initializer = initializer,
-                  name = 'Output'))
-  model.add(Activation('softplus', name = 'Softplus'))
-  # compile the model
-  if RI:
-    model.compile(loss = losses, metrics = [RI_metric], optimizer = optimizer)
-  else:
-    model.compile(loss = losses, optimizer = optimizer)
-  return model
+    optimizer = keras.optimizers.Adam(clipnorm = 1.0, learning_rate = 1e-4)
 
-def summary_model(K=4, n_neurons=128, losses=''):
+    # Layer sizes
+    n_hidden_1 = n_neurons
+    n_hidden_2 = n_hidden_1 // 2
+    n_hidden_3 = n_hidden_2 // 2
+
+    # Weight initializer
+    initializer = keras.initializers.HeUniform(seed = 2718)
+
+    # Build the model
+    model = Sequential()
+    model.add(Input(shape=(input_shape, ), name = 'Input'))
+
+    # Hidden Layer 1
+    model.add(Dense(n_hidden_1, kernel_initializer = initializer, use_bias = False, name = 'Hidden_1'))
+    model.add(BatchNormalization(name = 'Batch_1'))
+    model.add(Activation('relu', name = 'ReLU_1'))
+
+    # Hidden Layer 2
+    model.add(Dense(n_hidden_2, kernel_initializer = initializer, use_bias = False, name = 'Hidden_2'))
+    model.add(BatchNormalization(name = 'Batch_2'))
+    model.add(Activation('relu', name = 'ReLU_2'))
+
+    # Hidden Layer 3
+    model.add(Dense(n_hidden_3, kernel_initializer = initializer, use_bias = False, name = 'Hidden_3'))
+    model.add(BatchNormalization(name = 'Batch_3'))
+    model.add(Activation('relu', name = 'ReLU_3'))
+
+    # Output Layer: Mixture Parameters
+    model.add(Dense(NOUT, kernel_initializer = initializer, name = 'Output'))
+    model.add(Activation('softplus', name = 'Softplus'))
+
+    # Compile the model
+    if RI:
+        model.compile(loss = losses, metrics = [RI_metric], optimizer = optimizer)
+    else:
+        model.compile(loss = losses, optimizer = optimizer)
+
+    return model
+
+
+def summary_model(K = 4, n_neurons = 128, losses = ''):
     
-    model = Gamma_MDN(K,n_neurons,losses, np.ones((100,10)).shape[1], RI=False)
+    """
+    Prints the summary of the Gamma-MDN model.
+    """
+
+    model = Gamma_MDN(K, n_neurons, losses, 10, RI = False)
     model.summary()
 
 
 def PIT(z_true, z_pred):
-  # get mixture coefficients  
-  out_pi, out_alpha, out_beta = get_mixture_coef(z_pred)
-  # define mixture distribution
-  dist = tfd.Gamma(concentration = out_alpha, rate = out_beta)
-  # calculate CDF at true redshift
-  cdf = dist.cdf(z_true)
-  # take weights pi into account
-  M_cdf = tfm.multiply(out_pi, cdf)
-  # Return PIT=sum(pi*CDF)
-  return tfm.reduce_sum(M_cdf, 1, keepdims = True)
 
-#class CheckForNaNs(keras.callbacks.Callback):
-#    def on_epoch_end(self, epoch, logs=None):
-#        for key, value in logs.items():
-#            if isinstance(value, float) and tfm.is_nan(value):
-#                print(f"NaN detected in {key} at epoch {epoch}")
+    """
+    Computes the Probability Integral Transform (PIT) values for a gamma mixture model.
+    """
+
+    out_pi, out_alpha, out_beta = get_mixture_coef(z_pred)
+
+    # Define the gamma mixture components
+    dist = tfd.Gamma(concentration = out_alpha, rate = out_beta)
+
+    # Calculate CDF at true redshift
+    cdf = dist.cdf(z_true)
+
+    # Weight by mixture probabilities
+    weighted_cdf = tfm.multiply(out_pi, cdf)
+
+    # Return PIT as the sum over mixture components
+    return tfm.reduce_sum(weighted_cdf, axis = 1, keepdims = True)
+
 
 def RI_metric(z_true, z_pred):
-  tf.debugging.assert_all_finite(z_true, "z_true contains NaNs or Infs")
-  tf.debugging.assert_all_finite(z_pred, "z_pred contains NaNs or Infs")
-  # calculate PIT values
-  F_t = PIT(z_true, z_pred)
-  tf.debugging.assert_all_finite(F_t, "F_t contains NaNs or Infs")
-  # get relative number of observations in each bin
-  hist = tf.histogram_fixed_width(F_t, [0.0, 1.0], nbins = 20, dtype = tf.dtypes.int32, name = None)
-  k_t = tfm.divide(hist, tfm.reduce_sum(hist))
-  # calculate relative difference from uniformity
-  RI = tfm.abs(tfm.subtract(k_t, 1/20))
-  return tfm.reduce_sum(RI)
+
+    """
+    Computes the Relative Index (RI) metric, which quantifies the deviation of PIT histogram from uniformity.
+    """
+
+    tf.debugging.assert_all_finite(z_true, "z_true contains NaNs or Infs")
+    tf.debugging.assert_all_finite(z_pred, "z_pred contains NaNs or Infs")
+
+    # Calculate PIT values
+    F_t = PIT(z_true, z_pred)
+    tf.debugging.assert_all_finite(F_t, "F_t contains NaNs or Infs")
+
+    # Compute histogram (number of observations in each bin)
+    hist = tf.histogram_fixed_width(F_t, [0.0, 1.0], nbins = 20, dtype = tf.int32)
+
+    # Convert counts to relative frequencies
+    k_t = tfm.divide(hist, tfm.reduce_sum(hist))
+
+    # Compute the absolute difference from uniformity (ideal is 1/20 per bin)
+    RI = tfm.abs(k_t - (1.0 / 20))
+
+    # Sum of deviations gives the RI metric
+    return tfm.reduce_sum(RI)
 
 
 def pdf_mode(pis, alphas, betas):
-    """ Helper function to find the mode of the mixture PDF"""
+    
+    """
+    Compute the mode (most probable value) of a Gamma Mixture Model (GMM)
+    for each sample.
 
-    # define mixture distribution
+    Parameters
+    ----------
+    pis : np.array, shape (n_samples, K)
+        Mixture weights for each component.
+    alphas : np.array, shape (n_samples, K)
+        Shape parameters of the Gamma distributions.
+    betas : np.array, shape (n_samples, K)
+        Rate parameters of the Gamma distributions.
+
+    Returns
+    -------
+    mode : np.array, shape (n_samples,)
+        Mode of the mixture PDF for each sample.
+    """
+
+    # Define the mixture distribution
     gm = tfd.MixtureSameFamily(
-        mixture_distribution = tfd.Categorical(probs = pis),
-        components_distribution = tfd.Gamma(
-            concentration = alphas,
-            rate = betas))
+            mixture_distribution = tfd.Categorical(probs = pis),
+            components_distribution = tfd.Gamma(
+                concentration = alphas,
+                rate = betas)
+        )
 
-    # compute modes of each component
+    # Compute modes of individual Gamma components
     modes = (alphas - 1.0) / betas
 
-    # find value of mixture PDF at components modes
-    isFirst = True
-    for i in range(len(pis[0])):
-      if isFirst:
-        gm_modes = gm.prob(modes[:,0])
-        isFirst = False
-      else:
-        gm_modes = np.vstack([gm_modes, gm.prob(modes[:,i])])
+    # Evaluate the mixture PDF at each component's mode
+    gm_modes = np.vstack([gm.prob(modes[:, i]) for i in range(pis.shape[1])])
 
-    # find argument of mode giving largest PDF
+    # Find which component's mode has the highest PDF value for each sample
     mode_arg = np.argmax(gm_modes, axis = 0)
 
-    # find corresponding photo_z
-    mode = np.ones(pis.shape[0])
-    for i in range(pis.shape[0]):
-      mode[i] = modes[i, mode_arg[i]]
+    # Retrieve the mode corresponding to the maximum PDF for each sample
+    mode = modes[np.arange(pis.shape[0]), mode_arg]
 
     return mode
 
-def return_df(pis, alphas, betas, Y_valid, Y_dnf = None, ide = None):
-    """
-    Given the output of the MDN, returns
-    a DataFrame with mean, variance and stddev added
-    and Coefficient of Variance (CoV)
-    """
-    pi_names = ['pi_' + str(i) for i in range(len(pis[0]))]
-    alpha_names = ['alpha_' + str(i) for i in range(len(pis[0]))]
-    beta_names = ['beta_' + str(i) for i in range(len(pis[0]))]
-    means_names = ['mean_' + str(i) for i in range(len(pis[0]))]
-    std_names = ['sdtdev_' + str(i) for i in range(len(pis[0]))]
-    names = pi_names + alpha_names + beta_names + means_names + std_names
-    temp = np.concatenate((pis, alphas, betas, alphas/betas, np.sqrt(alphas)/betas), axis = 1)
-    df = pd.DataFrame(temp, columns = names)
 
-    variances = alphas/betas**2
-    means = (alphas / betas)
+def return_df(pis, alphas, betas, Y_valid, Y_dnf = None, ide = None):
+
+    """
+    Build a DataFrame summarizing the mixture components, means, variances,
+    standard deviations, and additional statistics from an MDN output.
+
+    Parameters
+    ----------
+    pis : np.array
+        Mixture weights, shape (n_samples, K).
+    alphas : np.array
+        Gamma distribution alpha parameters, shape (n_samples, K).
+    betas : np.array
+        Gamma distribution beta parameters, shape (n_samples, K).
+    Y_valid : np.array
+        True redshift values for the validation/test set.
+    Y_dnf : np.array, optional
+        Optional secondary redshift estimates (e.g., from another method).
+    ide : np.array or pd.Series, optional
+        Optional array of unique IDs to use as the DataFrame index.
+
+    Returns
+    -------
+    df : pd.DataFrame
+        DataFrame containing component parameters, means, variances, modes,
+        standard deviations, coefficient of variation (CoV), and true redshift values.
+    """
+
+    K = pis.shape[1]
+
+    # Build dynamic column names
+    pi_names = [f'pi_{i}' for i in range(K)]
+    alpha_names = [f'alpha_{i}' for i in range(K)]
+    beta_names = [f'beta_{i}' for i in range(K)]
+    means_names = [f'mean_{i}' for i in range(K)]
+    std_names = [f'stddev_{i}' for i in range(K)]
+
+    all_column_names = pi_names + alpha_names + beta_names + means_names + std_names
+
+    # Calculate means and standard deviations for each component
+    component_means = alphas / betas
+    component_stds = np.sqrt(alphas) / betas
+
+    # Build the base DataFrame
+    temp = np.concatenate((pis, alphas, betas, component_means, component_stds), axis = 1)
+    df = pd.DataFrame(temp, columns = all_column_names)
+
+    # Global statistics per sample
+    variances = alphas / betas**2
     modes = pdf_mode(pis, alphas, betas)
 
     df['Mode'] = modes
-    df['Mean'] = np.average(means, weights = pis, axis = 1)
-    df['variance'] =  np.average(means**2 + variances**2, weights = pis, axis = 1) - df['Mean'].values**2
-    df['stddev'] = np.sqrt(df.variance)
-    df['CoV'] = df['stddev']/df['Mean']
+    df['Mean'] = np.average(component_means, weights = pis, axis = 1)
+    df['variance'] = np.average(component_means**2 + variances, weights = pis, axis = 1) - df['Mean']**2
+    df['stddev'] = np.sqrt(df['variance'])
+    df['CoV'] = df['stddev'] / df['Mean']
+
+    # Add true redshift
     df['redshift'] = Y_valid
+
+    # Optional: Add secondary estimates or ID index
     if Y_dnf is not None:
         df['OTHERZ'] = Y_dnf
+
     if ide is not None:
         df['ID'] = ide
-        df.set_index('ID', inplace=True)
+        df.set_index('ID', inplace = True)
+
     return df
 
 
-def model_fit(X_train, Y_train, K, n_hidden, ri_bool, verbose = 1, validation_data = None, toSave = None, n_epoch = 200, batch_size = 256*2, val_freq = 1, inloop = False, mycp = None):
+def model_fit(X_train, Y_train, K, n_hidden, ri_bool, verbose = 1, validation_data = None, 
+        toSave = None, n_epoch = 200, batch_size = 512, val_freq = 1, lossF = 'll', 
+        inloop = False, mycp = None, early_stop = False):
+
+    """
+    Train a Gamma-MDN model with optional checkpointing.
+
+    Parameters
+    ----------
+    X_train : np.array
+        Training features.
+    Y_train : np.array
+        Training labels.
+    K : int
+        Number of mixture components.
+    n_hidden : list
+        List specifying the number of hidden units per layer.
+    ri_bool : bool
+        Whether to include Random Initialization regularization.
+    verbose : int, optional
+        Verbosity level for training output.
+    validation_data : tuple, optional
+        Validation dataset (X_val, Y_val).
+    toSave : str, optional
+        File path to save model checkpoints.
+    n_epoch : int, optional
+        Number of training epochs.
+    batch_size : int, optional
+        Training batch size.
+    val_freq : int, optional
+        Frequency (in epochs) of validation evaluation.
+    lossF : str, optional
+        Loss function, ll = log-likelihood (gm_ll_loss), crps = CRPS (crps_mixture_gamma)
+    inloop : bool, optional
+        If True, continues using a checkpoint provided in `mycp`.
+    mycp : keras.callbacks.ModelCheckpoint, optional
+        Existing checkpoint callback to use if inloop is True.
+    early_stop : bool, optional
+        If True, early stp based on val_loss. Setting val to 0.1 if not present
+
+    Returns
+    -------
+    history : keras.callbacks.History
+        Training history object.
+    model : keras.Model
+        Trained Gamma-MDN model.
+    mycp : keras.callbacks.ModelCheckpoint
+        Model checkpoint callback.
+    """
+
+    # Setup model checkpointing
     if toSave is not None and not inloop:
         mycp = keras.callbacks.ModelCheckpoint(filepath = toSave,
-            save_weights_only = True,
-            verbose = 0)
+                                        save_weights_only = True,
+                                        verbose = 0)
         cp_callback = [mycp]
     elif toSave is not None and inloop:
         cp_callback = [mycp]
     else:
         cp_callback = None
 
-    model = Gamma_MDN(K, n_hidden, gm_ll_loss, X_train.shape[1], ri_bool)
 
+    if lossF == 'll':
+        loss_function = gm_ll_loss
+    elif lossF == 'crps':
+        loss_function = crps_mixture_gamma
+    else:
+        raise Exception('Loss function not correctly set')
+
+    if early_stop:
+        # Define the early stopping callback
+        early_stop = EarlyStopping(
+            min_delta = 0.001,
+            monitor = 'val_loss',       # What to monitor
+            patience = 5,               # Number of epochs with no improvement after which training will be stopped
+            restore_best_weights = True # Restore model weights from the epoch with the best monitored value
+        )
+        if cp_callback is None:
+            cp_callback = [early_stop]
+        else:
+            cp_callback.append(early_stop)
+
+        validation_split = 0.1
+    else:
+        validation_split = 0.
+
+    # Instantiate the model
+    model = Gamma_MDN(K, n_hidden, loss_function, X_train.shape[1], ri_bool)
+    
+
+    # Train the model using GPU
     with tf.device('/device:GPU:0'):
         history = model.fit(X_train, Y_train,
                       validation_data = validation_data,# for first validation partition
-                      #validation_data = (X_val, Y_val),# for first validation partition
+                      validation_split = validation_split,
                       epochs = n_epoch,
                       batch_size = batch_size,
                       verbose = verbose,

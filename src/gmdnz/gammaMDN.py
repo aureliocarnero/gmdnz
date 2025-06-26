@@ -189,7 +189,6 @@ X_training_wo, Xtest_wo, Y_training_wo, Ytest_wo = train_test_split(Xwo, ywo, te
 
 
 
-
 '''TEMP
 # Define the K-fold Cross Validator
 kfold_wo = KFold(n_splits = n_folds, shuffle = True, random_state = 0)
@@ -217,7 +216,7 @@ for train, val in kfold_wo.split(X_training_wo, Y_training_wo):
     # evaluate and store performance
     if isFirst:
         X_train, _, pipe = DP.doPCA(X_training_wo[train])
-        X_val = DP.doPCA(X_training_wo[val], pipeline = pipe, fit_transform = False)
+        X_val, _, _ = DP.doPCA(X_training_wo[val], pipeline = pipe, fit_transform = False)
         history, model, mycp = GM.model_fit(X_train, Y_train, K, n_hidden_1, True, validation_data = (X_val, Y_val), toSave = 'test_in_original_noY_model_callback.weights.h5', inloop = False)
         isFirst = False
         cv_train_loss_wo_cv = history.history['loss']
@@ -227,7 +226,7 @@ for train, val in kfold_wo.split(X_training_wo, Y_training_wo):
 
     else: 
         X_train, _, pipe = DP.doPCA(X_training_wo[train], pipeline = pipe)
-        X_val = DP.doPCA(X_training_wo[val], pipeline = pipe, fit_transform = False)
+        X_val, _, _ = DP.doPCA(X_training_wo[val], pipeline = pipe, fit_transform = False)
 
         history, model, mycp = GM.model_fit(X_train, Y_train, K, n_hidden_1, True, validation_data = (X_val, Y_val), toSave = 'test_in_original_noY_model_callback.weights.h5', inloop = True, mycp = mycp)
         cv_train_loss_wo_cv = np.vstack((cv_train_loss_wo_cv, history.history['loss']))
@@ -255,11 +254,10 @@ epoch_min_wo_cv_wo = np.argmin(mean_val_RI_wo_cv) + 1
 
 
 PL.train_val_loss(epochs_train, mean_train_loss_wo_cv, mean_train_RI_wo_cv, title = 'without Y channel', valdata = [epochs_val, mean_val_loss_wo_cv, mean_val_RI_wo_cv])
-ENDTEMP'''
 #print("For model with Y channel: %0.f" %(np.argmin(mean_val_loss_w_cv)+1))
 print("")
 #print("For model without Y channel: %0.f" %(np.argmin(mean_val_loss_wo_cv) + 1))
-
+END TEMP'''
 X_train_wo, _, pipe = DP.doPCA(X_training_wo)
 X_test_wo, _, _ = DP.doPCA(Xtest_wo, pipeline = pipe, fit_transform = False)
 
@@ -269,11 +267,12 @@ Y_test_wo = Ytest_wo.to_numpy()[:, np.newaxis]
 
 load = True
 if load:
+    #model_wo = GM.Gamma_MDN(K, n_hidden_1, GM.crps_mixture_gamma, X_train_wo.shape[1], True)
     model_wo = GM.Gamma_MDN(K, n_hidden_1, GM.gm_ll_loss, X_train_wo.shape[1], True)
     model_wo.load_weights('aure_original_second_callback_noY.weights.h5')
 else:
 
-    history, model_wo, mycp = GM.model_fit(X_train_wo, Y_train_wo, K, n_hidden_1, True, toSave = 'aure_original_second_callback_noY.weights.h5', inloop = False, n_epoch = 200)
+    history, model_wo, mycp = GM.model_fit(X_train_wo, Y_train_wo, K, n_hidden_1, True, toSave = 'aure_original_second_callback_noY.weights.h5', inloop = False, n_epoch = 200, lossF = 'll')
 
 
 ### Without Y channel
@@ -343,7 +342,7 @@ PL.plot_examples_pdfs(Y_test_wo, pi_ts_wo, alpha_ts_wo, beta_ts_wo, num_cols = 6
 variance_wo=res_ts_wo['variance'].values
 i_sort_wo=np.argsort(variance_wo)
 
-PL.plot_examples_pdfs(Y_test_wo, pi_ts_wo, alpha_ts_wo, beta_ts_wo, num_cols = 6, num_rows = 3, namesave = 'examples_pdfs_crps', title = 'Sorted by variance', ordered = i_sort_wo)
+PL.plot_examples_pdfs(Y_test_wo, pi_ts_wo, alpha_ts_wo, beta_ts_wo, num_cols = 6, num_rows = 3, namesave = 'examples_pdfs', title = 'Sorted by variance', ordered = i_sort_wo)
 
 
 
@@ -367,6 +366,7 @@ PL.plot_heat_map(pi_ts_wo, alpha_ts_wo, beta_ts_wo, Y_test_wo, num_seg, 'Oranges
 
 
 
+
 X_train_wo, _, pipe = DP.doPCA(Xwo)
 #X_test_wo, _, _ = DP.doPCA(Xtest_wo, pipeline = pipe, fit_transform = False)
 
@@ -376,10 +376,11 @@ X_train_wo, _, pipe = DP.doPCA(Xwo)
 load = False
 
 if load:
+    #model_wo = GM.Gamma_MDN(K, n_hidden_1, GM.crps_mixture_gamma, X_train_wo.shape[1], True)
     model_wo = GM.Gamma_MDN(K, n_hidden_1, GM.gm_ll_loss, X_train_wo.shape[1], True)
     model_wo.load_weights('aure_new_callback_noY.weights.h5')
 else:
-    history, model_wo, mycp = GM.model_fit(X_train_wo, ywo, K, n_hidden_1, True, toSave = 'aure_original_final_callback_noY.weights.h5', inloop = False, n_epoch = 850)
+    history, model_wo, mycp = GM.model_fit(X_train_wo, ywo, K, n_hidden_1, True, toSave = 'aure_original_final_callback_noY.weights.h5', inloop = False, n_epoch = 850, early_stop = True, lossF = 'll')
 
 
 feat_sel = ['COADD_OBJECT_ID','Z','SOF_CM_T','SOF_CM_MAG_CORRECTED_G', 'SOF_CM_MAG_CORRECTED_R', 'SOF_CM_MAG_CORRECTED_I', 'SOF_CM_MAG_CORRECTED_Z', 'MAG_AUTO_CORRECTED_Y', 'ERR_Z', 'SOF_CM_T_ERR','SOF_CM_MAG_ERR_G', 'SOF_CM_MAG_ERR_R', 'SOF_CM_MAG_ERR_I', 'SOF_CM_MAG_ERR_Z', 'MAGERR_AUTO_Y', 'ZMEAN_Y4']
@@ -464,38 +465,13 @@ z_rel, RI_wo = PL.pit_plot_z(output_wo, photo_z_wo, y_ts, redshift_bins = None, 
 
 PL.val_with_z(RI_wo, z_rel, valname = 'RI', namesave = 'ri_plot_z', title = 'Without Y channel')
 
+PL.plot_heat_map(pi_ts_wo, alpha_ts_wo, beta_ts_wo, y_ts, num_seg, 'Oranges')
+
+PL.plot_examples_pdfs(y_ts, pi_ts_wo, alpha_ts_wo, beta_ts_wo, num_cols = 6, num_rows = 3, namesave = 'examples_pdfs', title = 'Sorted by variance', ordered = i_sort_wo)
+
 
 res = DP.save_results('predicted_means_gammaMDN_vs_DNF_vs_actual_My_gammaMDN_withT_test.csv', res_ts_wo, summary = False)
 
 
-'''df_means_pred = res_ts_wo[['Mean']].copy()
-
-df_means_pred = df_means_pred.rename(columns={'Mean': 'z_gammaMDN_woY'})
-#df_means_pred['z_gammaMDN_woY'] = res_ts_wo['Mean']
-df_means_pred['z_dnf'] = res_ts_wo['OTHERZ']
-df_means_pred['z_spec'] = res_ts_wo['redshift']
-
-df_means_pred.head(5)
-'''
-
 PL.plot_mean_true(res, res['redshift'], namesave = 'plot_mean_true_final', title = 'TEST SAMPLE', other = 'Mode')
 
-'''
-fig, ax = plt.subplots(1,1,figsize=(7,7))
-ax.scatter(df_means_pred.z_spec,df_means_pred.z_dnf,s=0.5)
-#ax.scatter(df_means_pred.z_spec,df_means_pred.z_gammaMDN_wY,s=0.5)
-ax.scatter(df_means_pred.z_spec,df_means_pred.z_gammaMDN_woY,s=0.5)
-ax.plot([0, max(df_means_pred.z_spec)], [0, max(df_means_pred.z_spec)], linewidth=1, color='k')
-ax.set_xlim(0, max(df_means_pred.z_spec))
-ax.set_ylim(0, max(df_means_pred.z_spec))
-ax.set_xlabel('Redshift (Truth)', fontsize=18)
-ax.set_ylabel('Redshift (Photometric)', fontsize=18)
-ax.set_title('Test Set', fontsize=18)
-plt.show()
-'''
-# Load the Drive helper and mount
-
-# This will prompt for authorization.
-
-#create a csv file
-#df_means_pred.to_csv("predicted_means_gammaMDN_vs_DNF_vs_actual_My_gammaMDN_withT_1_11Nov2020.csv", index=True, header=True)
